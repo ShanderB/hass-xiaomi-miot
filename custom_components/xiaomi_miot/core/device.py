@@ -195,6 +195,7 @@ class Device(CustomConfigHelper):
         self.converters: list[BaseConv] = []
         self.coordinators: list[DataCoordinator] = []
         self.main_coordinators: list[DataCoordinator] = []
+        self.vacuum_map_coordinator: Optional[DataCoordinator] = None
         self.log = logging.getLogger(f'{__name__}.{self.model}')
 
     async def async_init(self):
@@ -543,18 +544,20 @@ class Device(CustomConfigHelper):
             lst.append(
                 DataCoordinator(self, self.update_miio_commands, update_interval=timedelta(seconds=interval)),
             )
-        if self.vacuum_map_property:
+        if self.vacuum_map_property and not self.custom_config_bool('disable_map_camera'):
             # Own, much slower coordinator: this downloads+decrypts a cloud
             # file (not a local miIO property poll), so it's independent of
             # the interval/chunk_coordinators tuning above. 30s matches how
             # fluidly a live cleaning session's robot position/trail update
             # without pushing so hard it risks Xiaomi cloud rate-limiting.
-            # No entity in this integration currently reads the result
-            # (Device.data['vacuum_map']) - this just keeps it decoded and
-            # ready for whatever does (e.g. a future map camera).
-            lst.append(
-                DataCoordinator(self, self.update_vacuum_map, update_interval=timedelta(seconds=30)),
-            )
+            # This is the single source of truth for the decoded map
+            # (Device.data['vacuum_map']) - camera.py's RobotMapCamera reads
+            # it via self.vacuum_map_coordinator instead of downloading its
+            # own copy, so gating on the same `disable_map_camera` flag the
+            # camera used to check on its own actually stops all cloud
+            # polling for opted-out users, not just the camera's rendering.
+            self.vacuum_map_coordinator = DataCoordinator(self, self.update_vacuum_map, update_interval=timedelta(seconds=30))
+            lst.append(self.vacuum_map_coordinator)
         self.coordinators.extend(lst)
 
         idx = 0
@@ -1322,30 +1325,40 @@ class Device(CustomConfigHelper):
 
     @cached_property
     def vacuum_map_property(self):
-        """The vacuum's own map-obj-name property, if the spec has one
+        """The vacuum's own map_obj_name property, if the spec has one
         (SIID10 PIID1 on xiaomi.vacuum.ov42gl/H50 Pro) - resolved from the
         spec rather than a hardcoded model check, so any device sharing the
-        exact same `vacuum-map` service/property is picked up automatically.
+        exact same `vacuum_map` service/property is picked up automatically.
         The AES decrypt algorithm in `core/vacuum_map.py` is only confirmed
         correct for 3iRobotics-manufactured units though - `update_vacuum_map`
         double-checks the cloud response before trusting it (see its own
         comment), so exposing this property alone doesn't guarantee the map
         will actually decode for a different manufacturer's device.
-        """
+
+        Underscore, not dash: `get_service`/`get_property` match literally
+        (see `convert_globs_to_pattern` in core/utils.py, plain
+        `fnmatch.translate` with no dash/underscore normalization) against
+        `MiotService`/`MiotProperty.name`, which are stored underscored -
+        same convention camera.py's own `spec.get_service('vacuum_map')`
+        and vacuum.py's `get_property('restricted_sweep_areas')` etc. use.
+        A dashed query here always returned None, silently disabling this
+        coordinator (and the whole map camera feature) for every user of
+        this model."""
         if not self.spec:
             return None
-        srv = self.spec.get_service('vacuum-map')
-        return srv.get_property('map-obj-name') if srv else None
+        srv = self.spec.get_service('vacuum_map')
+        return srv.get_property('map_obj_name') if srv else None
 
     async def update_vacuum_map(self):
         """Downloads and decrypts this vacuum's cloud map file (see
         core/vacuum_map.py for the full pipeline). The decoded JSON is
         stashed on `self.data['vacuum_map']` - not exposed as a regular
         property/sensor since it's a large nested structure, not a simple
-        value; no entity in this integration currently reads it, but a
-        camera (or any other) entity added later only needs to read
-        `Device.data['vacuum_map']`, everything else is already wired up
-        here."""
+        value. camera.py's RobotMapCamera is the reader: it subscribes to
+        this method's coordinator (`self.vacuum_map_coordinator`) instead of
+        polling the cloud itself, so this is the single source of truth for
+        the decoded map - see `init_coordinators` for the `disable_map_camera`
+        gating that also applies here."""
         from .vacuum_map import decrypt_map_payload, MAP_FILE_URL_API
 
         prop = self.vacuum_map_property
@@ -1387,8 +1400,13 @@ class Device(CustomConfigHelper):
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 raw_bytes = await resp.read()
             map_data = decrypt_map_payload(raw_bytes, self.model, str(self.did))
-            self.data['vacuum_map'] = map_data
-            return map_data
+            if map_data != self.data.get('vacuum_map'):
+                # Only replace with a new object when the content actually
+                # changed - camera.py's render cache keys off id(map_data),
+                # so keeping the same reference across identical polls lets
+                # it skip a full Pillow re-render for no reason every 30s.
+                self.data['vacuum_map'] = map_data
+            return self.data['vacuum_map']
         except Exception as exc:
             # A transient cloud/network miss shouldn't blank out an
             # otherwise-good map - keep serving the last successful decode.

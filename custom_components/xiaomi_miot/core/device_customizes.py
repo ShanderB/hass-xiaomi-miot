@@ -2652,16 +2652,17 @@ DEVICE_CUSTOMIZES = {
         # were derived from the full exported spec, not guessed.
         'interval_seconds': 120,
         'exclude_miot_services': 'vacuum_map,custom,voice_management,ai_small_pictures,self_check',
-        # `room_information`/`restricted_sweep_areas`/`restricted_walls` stay excluded on
-        # purpose: room data is read directly (and room/zone editing entities are built
-        # dynamically) by MiotOv42glVacuumEntity in vacuum.py instead of the generic
-        # property-to-entity pipeline - see the README's room/zone/schedule section.
+        # `room_information`/`restricted_sweep_areas`/`restricted_walls`/`order_clean`/
+        # `enable_time_period` stay excluded on purpose: room, zone, schedule and DND
+        # data are all read directly (and their editing entities built dynamically) by
+        # MiotOv42glVacuumEntity in vacuum.py instead of the generic property-to-entity
+        # pipeline - see the README's room/zone/schedule section.
         'exclude_miot_properties': 'vacuum_frameware_version,common_params,button_type,current_cleaning_config,'
                                    'user_define_sweep_cfg,user_define_sweep_id,vacuum_route,action_result,'
                                    'plugin_info_remind,notice,sweep_ai_object,sweep_furniture,carpet_object,'
                                    'water_check_list,furniture_for_automation,sill,zone_ids,restricted_sweep_areas,'
-                                   'restricted_walls,vacuum_room_ids,room_information,'
-                                   'map_complete_dialog,fault_ids',
+                                   'restricted_walls,vacuum_room_ids,room_information,order_clean,'
+                                   'enable_time_period,map_complete_dialog,fault_ids',
         # `fault` is deliberately NOT listed here even though it's a plain readable property -
         # MiotFaultLabelConv (append_converters below) already registers a `sensor.fault`
         # converter with the same attr/domain, and the generic entity-creation pass below skips
@@ -2676,17 +2677,14 @@ DEVICE_CUSTOMIZES = {
                                     'auto_water_change_installed',
         'switch_properties': 'no_disturb,alarm,physical_control_locked',
         'number_properties': 'frequency_mop_wash_by_time',
+        # DND (`enable_time_period`)/schedule (`order_clean`) are deliberately NOT
+        # wired here as converters - vacuum.py's MiotOv42glVacuumEntity builds their
+        # time/switch/select sub-entities directly (see its DND/schedule sections),
+        # with correct read-modify-write via in-memory state. A converter-based
+        # duplicate of the same entities used to exist here; it was removed both for
+        # the duplication and because its read-modify-write cache never actually
+        # round-tripped through `device.props`, clobbering sibling fields on write.
         'append_converters': [
-            {
-                'services': ['no_disturb'],
-                # `enable_time_period` (siid 11, piid 2) packs the DND start+end time into one
-                # uint32; decoded/encoded via MiotDndStartTimeConv/MiotDndEndTimeConv (read-modify-write
-                # so writing one `time.dnd_*` entity never clobbers the other half).
-                'converters': [
-                    {'props': ['enable_time_period'], 'attr': 'dnd_start', 'domain': 'time', 'class': MiotDndStartTimeConv},
-                    {'props': ['enable_time_period'], 'attr': 'dnd_end', 'domain': 'time', 'class': MiotDndEndTimeConv},
-                ],
-            },
             {
                 'services': ['vacuum'],
                 'converters': [
@@ -2697,18 +2695,6 @@ DEVICE_CUSTOMIZES = {
                     # decoded from a JSON property the generic pipeline would otherwise just
                     # show as a raw, undecoded string.
                     {'props': ['base_station_working_status'], 'attr': 'base_station_activity', 'domain': 'sensor', 'class': MiotBaseStationModeConv},
-                    # Cleaning schedule (`order_clean`, single slot) - see the converters'
-                    # own docstrings in converters.py for the packed-JSON format.
-                    {'props': ['order_clean'], 'attr': 'schedule_enabled', 'domain': 'switch', 'class': MiotScheduleEnabledConv},
-                    {'props': ['order_clean'], 'attr': 'schedule_time', 'domain': 'time', 'class': MiotScheduleTimeConv},
-                    {'props': ['order_clean'], 'attr': 'schedule_mode', 'domain': 'select', 'class': MiotScheduleModeConv},
-                    {'props': ['order_clean'], 'attr': 'schedule_day_sunday', 'domain': 'switch', 'class': MiotScheduleDaySundayConv},
-                    {'props': ['order_clean'], 'attr': 'schedule_day_monday', 'domain': 'switch', 'class': MiotScheduleDayMondayConv},
-                    {'props': ['order_clean'], 'attr': 'schedule_day_tuesday', 'domain': 'switch', 'class': MiotScheduleDayTuesdayConv},
-                    {'props': ['order_clean'], 'attr': 'schedule_day_wednesday', 'domain': 'switch', 'class': MiotScheduleDayWednesdayConv},
-                    {'props': ['order_clean'], 'attr': 'schedule_day_thursday', 'domain': 'switch', 'class': MiotScheduleDayThursdayConv},
-                    {'props': ['order_clean'], 'attr': 'schedule_day_friday', 'domain': 'switch', 'class': MiotScheduleDayFridayConv},
-                    {'props': ['order_clean'], 'attr': 'schedule_day_saturday', 'domain': 'switch', 'class': MiotScheduleDaySaturdayConv},
                 ],
             },
         ],
@@ -2729,7 +2715,7 @@ DEVICE_CUSTOMIZES = {
             {'interval': 61, 'props': 'mop_status,fault,no_disturb,current_no_disturb'},
             {'interval': 130, 'props': 'auto_*,*_detection,carpet_*,water_*'},
             {'interval': 300, 'props': 'brush_l*,filter_l*,dust_bag_l*'},
-            {'interval': 999, 'props': 'statistical_*,last_clean_time,enable_time_period,order_clean'},
+            {'interval': 999, 'props': 'statistical_*,last_clean_time'},
         ],
     },
     'xiaomi.vacuum.ov42gl:last_clean_time': {

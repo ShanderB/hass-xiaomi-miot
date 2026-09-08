@@ -2,17 +2,13 @@
 schedule (`order_clean`, SIID2 PIID19) and DND period (`enable_time_period`,
 SIID11 PIID2). No Home Assistant imports - see vacuum_zones.py/vacuum_maps.py
 for the same pattern; this module is used directly by vacuum.py's own
-schedule/DND entities rather than through a MiotPropConv.
-
-The day-bit/mode constants and DND pack/unpack format below intentionally
-duplicate the ones already reverse-engineered in core/converters.py (for
-MiotSchedule*Conv/MiotDndStartTimeConv/MiotDndEndTimeConv, defined there for
-xiaomi.vacuum.ov42gl's append_converters entry, which isn't reliably
-producing entities for this device today - see vacuum.py's own schedule/DND
-section for why this module is the actual wiring instead). Duplicated
-rather than imported so this stays dependency-free and unit-testable
-without Home Assistant installed, same as vacuum_maps.py/vacuum_zones.py -
-converters.py itself imports `homeassistant.util`.
+schedule/DND entities (with correct read-modify-write via in-memory
+`self._dnd`/`self._schedule` state) rather than through a MiotPropConv -
+an earlier converter-based duplicate of these same entities lived in
+core/converters.py, but was removed (both for the duplication and a
+read-modify-write bug in its `device.props`-backed cache). Kept
+dependency-free and unit-testable without Home Assistant installed, same as
+vacuum_maps.py/vacuum_zones.py.
 """
 import json
 import time as time_module

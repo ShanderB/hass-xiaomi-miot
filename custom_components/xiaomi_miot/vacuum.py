@@ -35,9 +35,6 @@ from .core.miot_spec import (
     MiotService,
 )
 from .core.vacuum_zones import (
-    ZONE_SIID,
-    RESTRICTED_AREAS_PIID,
-    RESTRICTED_WALLS_PIID,
     ZONE_TYPE_NO_SWEEP_AND_MOP,
     ZONE_TYPE_LABELS,
     LABEL_TO_ZONE_TYPE,
@@ -48,9 +45,6 @@ from .core.vacuum_zones import (
     parse_zone_property_values,
 )
 from .core.vacuum_maps import (
-    MAP_SIID,
-    MAP_MANAGEMENT_PIID,
-    BACKUP_MAP_LIST_PIID,
     MAX_SAVED_MAPS,
     parse_map_management,
     parse_backup_map_list,
@@ -694,18 +688,20 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
         new_buttons, new_switches, new_texts = [], [], []
         for room_id, room_name in rooms:
             # Explicit `entity_id` (slugified from the room name, e.g.
-            # "Living room" -> select_room_living_room) rather than letting
-            # Home Assistant derive one from the entity's full display name
-            # (which would fold in the device's own name too, producing an
-            # unpredictable id that differs per installation). This mirrors
-            # the naming scheme already used by the older xiaomi_miot_tools
-            # add-on this replaces, so a dashboard referencing
-            # `switch.select_room_*`/`button.clean_selected_rooms` keeps
-            # working after migrating to this integration's own entities.
+            # "Living room" -> select_room_ab12_living_room) rather than
+            # letting Home Assistant derive one from the entity's full
+            # display name (which would fold in the device's own name too,
+            # producing an unpredictable id that differs per installation).
+            # Prefixed with this device's own entity_id_prefix (the same
+            # MAC-derived prefix every other entity in this integration
+            # uses) so a second H50 Pro in the same house doesn't collide
+            # with this one's room entities - e.g. two vacuums both having a
+            # "Living room" would otherwise fight over the same
+            # switch.select_room_living_room.
             sub = f'clean_room_{room_id}'
             self._subs[sub] = ButtonSubEntity(self, sub, option={
                 'name': f'{self.device_name} Clean Room: {room_name}',
-                'entity_id': f'clean_room_{room_name}',
+                'entity_id': f'{self.entity_id_prefix}_clean_room_{room_name}',
                 'async_press_action': self._async_clean_rooms,
                 'press_kwargs': {'room_ids': [room_id]},
             })
@@ -714,7 +710,7 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
             sub = f'select_room_{room_id}'
             self._subs[sub] = _StagingSwitch(self, sub, option={
                 'name': f'{self.device_name} Select Room: {room_name}',
-                'entity_id': f'select_room_{room_name}',
+                'entity_id': f'{self.entity_id_prefix}_select_room_{room_name}',
             })
             room_switches[room_id] = self._subs[sub]
             new_switches.append(self._subs[sub])
@@ -723,7 +719,7 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
                 sub = f'rename_room_{room_id}'
                 self._subs[sub] = TextSubEntity(self, sub, option={
                     'name': f'{self.device_name} Rename Room: {room_name}',
-                    'entity_id': f'rename_room_{room_name}',
+                    'entity_id': f'{self.entity_id_prefix}_rename_room_{room_name}',
                     'native_value': room_name,
                     'async_set_value_action': self._make_rename_room_action(room_id, rename_action),
                 })
@@ -734,7 +730,7 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
             sub = 'clean_selected_rooms'
             self._subs[sub] = ButtonSubEntity(self, sub, option={
                 'name': f'{self.device_name} Clean Selected Rooms',
-                'entity_id': 'clean_selected_rooms',
+                'entity_id': f'{self.entity_id_prefix}_clean_selected_rooms',
                 'async_press_action': self._async_clean_selected_rooms,
                 'press_kwargs': {'room_switches': room_switches},
             })
@@ -781,6 +777,35 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
             entity.async_write_ha_state()
         return _do_rename
 
+    # -- Shared local-property read helper --------------------------------
+
+    async def _async_read_properties(self, mapping: dict) -> dict:
+        """Reads multiple MIoT properties in one local request. Returns a
+        {(siid, piid): value} dict of only the successfully-read ones
+        (code == 0) - shared by every siid/piid read below (zones, maps,
+        DND/schedule raw values, extra sensors) instead of each repeating
+        its own try/except + code==0 filtering loop. did is not required
+        here: async_get_properties_for_mapping only uses it as a
+        per-property request/response matching label (falls back to
+        'prop.{siid}.{piid}' when absent - see its own body in device.py),
+        not for local addressing/auth. Requiring it blocked reads whenever
+        the device's cloud did hadn't resolved yet, even though local
+        (IP+token) works fine without it."""
+        if not self.device.local:
+            return {}
+        try:
+            results = await self.device.local.async_get_properties_for_mapping(
+                did=self.device.did, mapping=mapping,
+            )
+        except Exception as exc:
+            self.logger.debug('%s: failed to read properties %s: %s', self.name_model, list(mapping), exc)
+            return {}
+        return {
+            (item.get('siid'), item.get('piid')): item.get('value')
+            for item in results or []
+            if item.get('code') == 0
+        }
+
     # -- Virtual wall / restricted zone editor ---------------------------
 
     async def _async_read_zones(self):
@@ -790,29 +815,12 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
         core/vacuum_zones.py. No cloud map involved."""
         prop_regions = self._miot_service.get_property('restricted_sweep_areas')
         prop_walls = self._miot_service.get_property('restricted_walls')
-        # did is not required here: async_get_properties_for_mapping only uses
-        # it as a per-property request/response matching label (falls back to
-        # 'prop.{siid}.{piid}' when absent - see its own body in device.py),
-        # not for local addressing/auth. Requiring it blocked reads whenever
-        # the device's cloud did hadn't resolved yet, even though local
-        # (IP+token) works fine without it.
-        if not (prop_regions and prop_walls and self.device.local):
+        if not (prop_regions and prop_walls):
             return [], []
-        try:
-            results = await self.device.local.async_get_properties_for_mapping(
-                did=self.device.did,
-                mapping={
-                    'restricted_sweep_areas': {'siid': prop_regions.siid, 'piid': prop_regions.iid},
-                    'restricted_walls': {'siid': prop_walls.siid, 'piid': prop_walls.iid},
-                },
-            )
-        except Exception as exc:
-            self.logger.debug('%s: failed to read zones/walls: %s', self.name_model, exc)
-            return [], []
-        values = {}
-        for item in results or []:
-            if item.get('code') == 0:
-                values[(item.get('siid'), item.get('piid'))] = item.get('value')
+        values = await self._async_read_properties({
+            'restricted_sweep_areas': {'siid': prop_regions.siid, 'piid': prop_regions.iid},
+            'restricted_walls': {'siid': prop_walls.siid, 'piid': prop_walls.iid},
+        })
         regions_raw = values.get((prop_regions.siid, prop_regions.iid))
         walls_raw = values.get((prop_walls.siid, prop_walls.iid))
         return parse_zone_property_values(regions_raw, walls_raw)
@@ -828,6 +836,13 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
 
         from .number import NumberSubEntity
         from .button import ButtonSubEntity
+
+        # Resolved once here (from the spec, not hardcoded) and reused by
+        # both _async_read_zones and _async_write_zones, so reads and
+        # writes always target the same siid/piid even if a future device
+        # sharing this same capability exposes them elsewhere.
+        self._zone_regions_prop = self._miot_service.get_property('restricted_sweep_areas')
+        self._zone_walls_prop = self._miot_service.get_property('restricted_walls')
 
         # Read once at setup, then kept in sync locally after every add/remove
         # made from HA (same "fetch once, HA-side edits update the cache
@@ -925,10 +940,14 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
 
     async def _async_write_zones(self, regions, walls):
         regions_payload, walls_payload = zone_write_payloads(regions, walls)
-        result = await self.async_set_miot_property(ZONE_SIID, RESTRICTED_AREAS_PIID, regions_payload)
+        result = await self.async_set_miot_property(
+            self._zone_regions_prop.siid, self._zone_regions_prop.iid, regions_payload,
+        )
         if not result or not result.is_success:
             raise HomeAssistantError(f'Failed to write zones: {result.error if result else "no response"}')
-        result = await self.async_set_miot_property(ZONE_SIID, RESTRICTED_WALLS_PIID, walls_payload)
+        result = await self.async_set_miot_property(
+            self._zone_walls_prop.siid, self._zone_walls_prop.iid, walls_payload,
+        )
         if not result or not result.is_success:
             raise HomeAssistantError(f'Failed to write walls: {result.error if result else "no response"}')
 
@@ -943,35 +962,27 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
 
     async def _async_read_maps(self):
         """Reads map-management/backup-map-list directly off the device
-        (SIID10 PIID5/13 - a separate MIoT service from the main vacuum one,
-        excluded from the generic pipeline; see core/vacuum_maps.py for why).
-        No cloud map download involved - both are already plain JSON, unlike
-        the rendered map file in core/vacuum_map.py. Returns ([], []) if
-        local isn't ready yet or the read fails - callers must not treat
-        that as "unsupported" (see _async_setup_map_entities, which gates
-        entity creation on the service existing in the spec, not on this
-        read succeeding - same contract as _async_read_zones). did is not
-        required - see the comment in _async_read_zones for why."""
-        if not self.device.local:
+        (a separate MIoT service from the main vacuum one, excluded from
+        the generic pipeline; see core/vacuum_maps.py for why), resolving
+        their siid/piid from the spec (self._map_service, set by
+        _async_setup_map_entities before this is ever called) rather than
+        hardcoding them - same as _async_read_zones. No cloud map download
+        involved - both are already plain JSON, unlike the rendered map
+        file in core/vacuum_map.py. Returns ([], []) if local isn't ready
+        yet or the read fails - callers must not treat that as
+        "unsupported" (see _async_setup_map_entities, which gates entity
+        creation on the service existing in the spec, not on this read
+        succeeding - same contract as _async_read_zones)."""
+        prop_management = self._map_service.get_property('map_management')
+        prop_backups = self._map_service.get_property('backup_map_list')
+        if not (prop_management and prop_backups):
             return [], []
-        try:
-            results = await self.device.local.async_get_properties_for_mapping(
-                did=self.device.did,
-                mapping={
-                    'map_management': {'siid': MAP_SIID, 'piid': MAP_MANAGEMENT_PIID},
-                    'backup_map_list': {'siid': MAP_SIID, 'piid': BACKUP_MAP_LIST_PIID},
-                },
-            )
-        except Exception as exc:
-            self.logger.debug('%s: failed to read map list: %s', self.name_model, exc)
-            return [], []
-        values = {}
-        for item in results or []:
-            if item.get('code') == 0:
-                values[(item.get('siid'), item.get('piid'))] = item.get('value')
-        maps = parse_map_management(values.get((MAP_SIID, MAP_MANAGEMENT_PIID)))
-        backups = parse_backup_map_list(values.get((MAP_SIID, BACKUP_MAP_LIST_PIID)))
-        self.logger.warning('%s: DEBUG11 raw map results=%s maps=%s backups=%s', self.name_model, results, maps, backups)
+        values = await self._async_read_properties({
+            'map_management': {'siid': prop_management.siid, 'piid': prop_management.iid},
+            'backup_map_list': {'siid': prop_backups.siid, 'piid': prop_backups.iid},
+        })
+        maps = parse_map_management(values.get((prop_management.siid, prop_management.iid)))
+        backups = parse_backup_map_list(values.get((prop_backups.siid, prop_backups.iid)))
         return maps, backups
 
     async def _async_setup_map_entities(self):
@@ -1005,7 +1016,7 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
         sub = 'save_map'
         self._subs[sub] = ButtonSubEntity(self, sub, option={
             'name': f'{self.device_name} Save Current Map',
-            'entity_id': 'save_current_map',
+            'entity_id': f'{self.entity_id_prefix}_save_current_map',
             'async_press_action': self._async_save_map,
         })
         new_buttons.append(self._subs[sub])
@@ -1016,7 +1027,7 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
             sub = 'restore_map_backup'
             self._subs[sub] = ButtonSubEntity(self, sub, option={
                 'name': f'{self.device_name} Restore Map Backup',
-                'entity_id': 'restore_map_backup',
+                'entity_id': f'{self.entity_id_prefix}_restore_map_backup',
                 'async_press_action': self._async_restore_map_backup,
             })
             new_buttons.append(self._subs[sub])
@@ -1031,7 +1042,7 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
             sub = 'delete_map'
             self._subs[sub] = ButtonSubEntity(self, sub, option={
                 'name': f'{self.device_name} Delete Selected Map',
-                'entity_id': 'delete_selected_map',
+                'entity_id': f'{self.entity_id_prefix}_delete_selected_map',
                 'async_press_action': self._async_delete_map,
             })
             new_buttons.append(self._subs[sub])
@@ -1046,7 +1057,7 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
         sub = f'use_map_{map_id}'
         self._subs[sub] = ButtonSubEntity(self, sub, option={
             'name': f'{self.device_name} Use Map: {map_label(entry)}',
-            'entity_id': f'use_map_{map_id}',
+            'entity_id': f'{self.entity_id_prefix}_use_map_{map_id}',
             'async_press_action': self._async_use_map,
             'press_kwargs': {'map_id': map_id},
         })
@@ -1058,7 +1069,7 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
         sub = f'rename_map_{map_id}'
         self._subs[sub] = TextSubEntity(self, sub, option={
             'name': f'{self.device_name} Rename Map: {map_label(entry)}',
-            'entity_id': f'rename_map_{map_id}',
+            'entity_id': f'{self.entity_id_prefix}_rename_map_{map_id}',
             'native_value': map_label(entry),
             'async_set_value_action': self._make_rename_map_action(map_id),
         })
@@ -1163,22 +1174,9 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
     # -- Do Not Disturb (packed start+end time) ---------------------------
 
     async def _async_read_raw_property(self, siid, piid):
-        """Single-property local read helper for DND/schedule below - did
-        is not required here, see the comment in _async_read_zones for why."""
-        if not self.device.local:
-            return None
-        try:
-            results = await self.device.local.async_get_properties_for_mapping(
-                did=self.device.did,
-                mapping={'value': {'siid': siid, 'piid': piid}},
-            )
-        except Exception as exc:
-            self.logger.debug('%s: failed to read %s/%s: %s', self.name_model, siid, piid, exc)
-            return None
-        for item in results or []:
-            if item.get('code') == 0:
-                return item.get('value')
-        return None
+        """Single-property local read helper for DND/schedule below."""
+        values = await self._async_read_properties({'value': {'siid': siid, 'piid': piid}})
+        return values.get((siid, piid))
 
     async def _async_setup_dnd_entities(self):
         no_disturb = self._miot_service.spec.get_service('no_disturb')
@@ -1198,7 +1196,7 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
             sub = f'dnd_{half}'
             self._subs[sub] = _StagingTime(self, sub, option={
                 'name': f'{self.device_name} DND {half.capitalize()}',
-                'entity_id': sub,
+                'entity_id': f'{self.entity_id_prefix}_{sub}',
                 'native_value': self._dnd_time_value(half),
                 'async_set_value_action': self._make_dnd_write_action(half),
             })
@@ -1246,7 +1244,7 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
         new_switches = []
         self._subs['schedule_enabled'] = _StagingSwitch(self, 'schedule_enabled', option={
             'name': f'{self.device_name} Schedule Enabled',
-            'entity_id': 'schedule_enabled',
+            'entity_id': f'{self.entity_id_prefix}_schedule_enabled',
             'is_on': schedule_enabled(self._schedule),
             'async_turn_on_action': self._make_schedule_enabled_action(True),
             'async_turn_off_action': self._make_schedule_enabled_action(False),
@@ -1257,7 +1255,7 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
             sub = f'schedule_day_{day}'
             self._subs[sub] = _StagingSwitch(self, sub, option={
                 'name': f'{self.device_name} Schedule Day: {day.capitalize()}',
-                'entity_id': sub,
+                'entity_id': f'{self.entity_id_prefix}_{sub}',
                 'is_on': schedule_day_enabled(self._schedule, day),
                 'async_turn_on_action': self._make_schedule_day_action(day, True),
                 'async_turn_off_action': self._make_schedule_day_action(day, False),
@@ -1270,7 +1268,7 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
             hour, minute = schedule_time(self._schedule)
             self._subs['schedule_time'] = _StagingTime(self, 'schedule_time', option={
                 'name': f'{self.device_name} Schedule Time',
-                'entity_id': 'schedule_time',
+                'entity_id': f'{self.entity_id_prefix}_schedule_time',
                 'native_value': dt_time(hour % 24, minute % 60),
                 'async_set_value_action': self._async_write_schedule_time,
             })
@@ -1279,7 +1277,7 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
         if add_selects:
             self._subs['schedule_mode'] = _StagingSelect(self, 'schedule_mode', option={
                 'name': f'{self.device_name} Schedule Mode',
-                'entity_id': 'schedule_mode',
+                'entity_id': f'{self.entity_id_prefix}_schedule_mode',
                 'options': list(SCHEDULE_MODE_LABELS.values()),
                 'current_option': schedule_mode_label(self._schedule),
                 'async_select_option_action': self._async_write_schedule_mode,
@@ -1367,7 +1365,12 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
             sub = f'extra_{name}'
             self._subs[sub] = _PolledSensor(self, sub, option={
                 'name': f'{self.device_name} {label}',
-                'entity_id': name,
+                # `sub` (not bare `name`) as the suffix: a couple of these
+                # properties (e.g. base_station_working_status) already have
+                # a same-named raw sensor from the generic pipeline at
+                # `{entity_id_prefix}_{name}` - the `extra_` prefix baked
+                # into `sub` keeps this decoded one from colliding with it.
+                'entity_id': f'{self.entity_id_prefix}_{sub}',
                 'unit': unit,
                 'device_class': device_class,
             })
@@ -1391,7 +1394,7 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
             self._status_detail_prop = status_prop
             self._subs['extra_status_detail'] = _PolledSensor(self, 'extra_status_detail', option={
                 'name': f'{self.device_name} Status Detail',
-                'entity_id': 'status_detail',
+                'entity_id': f'{self.entity_id_prefix}_extra_status_detail',
             })
             new_sensors.append(self._subs['extra_status_detail'])
 
@@ -1402,7 +1405,7 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
             if 'cleaning_progress' in props:
                 self._subs['extra_progress_detail'] = _PolledSensor(self, 'extra_progress_detail', option={
                     'name': f'{self.device_name} Progress Detail',
-                    'entity_id': 'progress_detail',
+                    'entity_id': f'{self.entity_id_prefix}_extra_progress_detail',
                     'unit': '%',
                 })
                 new_sensors.append(self._subs['extra_progress_detail'])
@@ -1430,35 +1433,28 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
             mapping['status'] = {'siid': status_prop.siid, 'piid': status_prop.iid}
         if status_prop and sweep_mop_type_prop:
             mapping['sweep_mop_type'] = {'siid': sweep_mop_type_prop.siid, 'piid': sweep_mop_type_prop.iid}
-        try:
-            results = await self.device.local.async_get_properties_for_mapping(did=self.device.did, mapping=mapping)
-        except Exception as exc:
-            self.logger.debug('%s: failed to refresh extra sensors: %s', self.name_model, exc)
-            return
+        values = await self._async_read_properties(mapping)
         by_siid_piid = {(p.siid, p.iid): name for name, p in props.items()}
         if status_prop:
             by_siid_piid[(status_prop.siid, status_prop.iid)] = 'status'
         if status_prop and sweep_mop_type_prop:
             by_siid_piid[(sweep_mop_type_prop.siid, sweep_mop_type_prop.iid)] = 'sweep_mop_type'
         raw_status = raw_base_station = raw_cleaning_progress = raw_sweep_mop_type = None
-        for item in results or []:
-            if item.get('code') != 0:
-                continue
-            name = by_siid_piid.get((item.get('siid'), item.get('piid')))
+        for (siid, piid), value in values.items():
+            name = by_siid_piid.get((siid, piid))
             if name == 'status':
-                raw_status = item.get('value')
+                raw_status = value
                 continue
             if name == 'sweep_mop_type':
-                raw_sweep_mop_type = item.get('value')
+                raw_sweep_mop_type = value
                 continue
             if name == 'base_station_working_status':
-                raw_base_station = item.get('value')
+                raw_base_station = value
             elif name == 'cleaning_progress':
-                raw_cleaning_progress = item.get('value')
+                raw_cleaning_progress = value
             entity = self._subs.get(f'extra_{name}') if name else None
             if not entity:
                 continue
-            value = item.get('value')
             if name == 'last_clean_time':
                 # `and value` used to gate this (instead of `is not None`) -
                 # 0 is falsy in Python, so a freshly-paired device (no clean
@@ -1673,11 +1669,15 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
     # -- Map camera layer toggles -------------------------------------------
     # Pure in-memory switches (no MIoT property backing them - there's
     # nothing to read from the device, the map image is rendered locally
-    # from data camera.py already downloads/decodes). camera.py reads these
-    # by entity_id via hass.states.get(...) rather than through self._subs
-    # directly, since the camera is a separate entity in a separate
-    # platform file - same fail-open default (missing/unknown == show the
-    # layer) as the input_boolean-based version this replaces.
+    # from data camera.py already reads off the device's map coordinator).
+    # camera.py reads these by entity_id via hass.states.get(...) rather
+    # than through self._subs directly, since the camera is a separate
+    # entity in a separate platform file - same fail-open default
+    # (missing/unknown == show the layer) as the input_boolean-based
+    # version this replaces. entity_id is device-prefixed (see
+    # entity_id_prefix below) so camera.py's lookup - built with the same
+    # prefix - always finds this vacuum's own toggles, not another H50
+    # Pro's.
 
     MAP_DISPLAY_TOGGLES = (
         ('map_show_base', 'Map Show Charging Station'),
@@ -1695,7 +1695,7 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
         for sub, label in self.MAP_DISPLAY_TOGGLES:
             self._subs[sub] = _StagingSwitch(self, sub, option={
                 'name': f'{self.device_name} {label}',
-                'entity_id': sub,
+                'entity_id': f'{self.entity_id_prefix}_{sub}',
                 'is_on': True,
             })
             new_switches.append(self._subs[sub])

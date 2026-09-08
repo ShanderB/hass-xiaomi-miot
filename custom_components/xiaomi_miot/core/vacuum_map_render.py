@@ -1,5 +1,5 @@
 """Renders decoded xiaomi.vacuum.ov42gl (H50 Pro) map JSON (see
-vacuum_map_codec.py) to a PNG image. No Home Assistant imports - only
+vacuum_map.py) to a PNG image. No Home Assistant imports - only
 Pillow, a core Home Assistant dependency already (used for camera
 snapshots/QR codes/etc across many integrations), so it doesn't need
 declaring separately in manifest.json.
@@ -13,8 +13,8 @@ below - no separate download per layer:
   - `fb_walls`: already-configured virtual walls (line segments)
 
 Colors and the coordinate math below were reverse-engineered from the real
-Xiaomi Home app's own map plugin (the same one vacuum_map_codec.py's crypto
-came from) so this renders close to the app's own visual style. The robot
+Xiaomi Home app's own map plugin (the same one vacuum_map.py's crypto came
+from) so this renders close to the app's own visual style. The robot
 marker itself (map_assets/robot.png) is a plain generic dot drawn for this
 project, not the app's own icon - the app's icon is a proprietary asset
 extracted from its bundle, unsuitable for redistribution here.
@@ -27,7 +27,7 @@ from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 ASSETS_DIR = Path(__file__).parent.parent / "map_assets"
 
@@ -74,45 +74,9 @@ FORBIDDEN_STYLES = {
 }
 FORBIDDEN_DASH = (7, 7)
 
-GRID_STEP_MM = 1000  # 1 meter - matches the mm coordinate space fb_point/
-# wall_points/position already use (confirmed empirically: this device's
-# map has resolution=50 (mm/px), origin_x/origin_y in the thousands).
-GRID_LINE_COLOR = (0, 0, 0, 50)
-GRID_LABEL_COLOR = (0, 0, 0, 170)
-
-
 @lru_cache(maxsize=2)
 def _load_icon(name: str) -> Image.Image:
     return Image.open(ASSETS_DIR / name).convert("RGBA")
-
-
-@lru_cache(maxsize=1)
-def _grid_font():
-    try:
-        return ImageFont.load_default(size=13)
-    except TypeError:
-        # Older Pillow (<10.1) doesn't take a size kwarg here.
-        return ImageFont.load_default()
-
-
-def _grid_lines_mm(map_data):
-    """World-mm coordinates of every grid line that falls inside the map,
-    shared by the pre-flip line pass and the post-flip label pass so both
-    draw at exactly the same positions."""
-    origin_x, origin_y = map_data["origin_x"], map_data["origin_y"]
-    resolution = map_data["resolution"]
-    max_x = origin_x + map_data["width"] * resolution
-    max_y = origin_y + map_data["height"] * resolution
-    xs, ys = [], []
-    x = math.ceil(origin_x / GRID_STEP_MM) * GRID_STEP_MM
-    while x <= max_x:
-        xs.append(x)
-        x += GRID_STEP_MM
-    y = math.ceil(origin_y / GRID_STEP_MM) * GRID_STEP_MM
-    while y <= max_y:
-        ys.append(y)
-        y += GRID_STEP_MM
-    return xs, ys, origin_x, origin_y, max_x, max_y
 
 
 def _dashed_line(draw, p1, p2, fill, width, dash):

@@ -7,7 +7,6 @@ import base64
 import requests
 import re
 import collections
-import aiohttp
 from os import urandom
 from functools import partial
 from urllib.parse import urlencode
@@ -21,8 +20,8 @@ from homeassistant.components.camera import (
     CameraEntityFeature,  # v2022.5
 )
 from homeassistant.components.ffmpeg import async_get_image, DATA_FFMPEG
-from homeassistant.helpers.event import async_track_point_in_utc_time, async_track_time_interval
-from homeassistant.helpers.aiohttp_client import async_aiohttp_proxy_stream, async_get_clientsession
+from homeassistant.helpers.event import async_track_point_in_utc_time
+from homeassistant.helpers.aiohttp_client import async_aiohttp_proxy_stream
 from haffmpeg.camera import CameraMjpeg
 
 from . import (
@@ -45,7 +44,6 @@ from .core.miot_spec import (
     MiotSpec,
     MiotService,
 )
-from .core.vacuum_map_codec import decrypt_map_payload
 from .core.vacuum_map_render import DEFAULT_SCALE, render_map_png
 
 _LOGGER = logging.getLogger(__name__)
@@ -730,13 +728,16 @@ class RobotMapCamera(MiotEntity, Camera):
     see vacuum.py), the actual rendered image is cloud-only: the
     manufacturer's map file is a blob on Xiaomi's cloud storage, readable
     only via a signed download URL + a decrypt algorithm with no local
-    equivalent (see core/vacuum_map_codec.py's own docstring). Reuses this
-    device's own already-authenticated cloud session (self.device.cloud) -
-    no separate login/session of its own.
+    equivalent (see core/vacuum_map.py's own docstring). The download+decrypt
+    itself is owned by Device.update_vacuum_map's own coordinator
+    (self.device.vacuum_map_coordinator) - this entity only subscribes to it
+    and reads the already-decoded `self.device.data['vacuum_map']`, rather
+    than polling the cloud a second time on its own.
 
     Redraws the PNG on every request (not just on the 30s poll) so the
-    three vacuum.py-owned layer toggles (switch.map_show_base/robot/zones)
-    apply instantly - only the underlying map JSON is cached/polled.
+    three vacuum.py-owned layer toggles (switch.{prefix}_map_show_base/
+    robot/zones) apply instantly - only the underlying map JSON is
+    cached/polled.
     """
 
     _attr_should_poll = False
@@ -750,21 +751,23 @@ class RobotMapCamera(MiotEntity, Camera):
         self._supported_features = CameraEntityFeature(0)
         self._name = f'{self.device_name} Map'
         self._unique_id = f'{self._unique_id}-map'
-        self.entity_id = f'{ENTITY_DOMAIN}.map'
+        # Device-scoped (not just `camera.map`) so a second vacuum of the
+        # same model doesn't collide with this one - same mechanism every
+        # other entity in this integration uses (__init__.py's
+        # entity_id_prefix / MiotEntity's own generate_entity_id).
+        self.entity_id = self._miot_service.spec.generate_entity_id(self, 'map', ENTITY_DOMAIN)
         # MiotEntity.__init__ defaults this to False, only ever flipped to
         # True by the standard polling cycle (async_update_from_device) -
         # which this entity deliberately skips (_attr_should_poll = False,
-        # its own 30s timer drives refreshes instead), so it would
-        # otherwise stay unavailable forever and the frontend would never
-        # even try to fetch an image. Availability here is tracked by
+        # the map coordinator listener drives refreshes instead), so it
+        # would otherwise stay unavailable forever and the frontend would
+        # never even try to fetch an image. Availability here is tracked by
         # whether a map has been successfully downloaded at least once
         # (self._map_data), not generic device polling.
         self._available = True
         self._map_data = None
         self._render_cache_key = None
         self._render_cache_png = None
-        map_srv = miot_service.spec.get_service('vacuum_map')
-        self._map_obj_name_prop = map_srv.get_property('map_obj_name') if map_srv else None
 
     @property
     def is_on(self):
@@ -796,71 +799,23 @@ class RobotMapCamera(MiotEntity, Camera):
         # this entity self-disable for every user of this model the
         # instant it shipped, not just those who actually opted out - a
         # regression discovered and fixed 2026-08-16 the same day this
-        # feature was added, before any release. When set, this stops the
-        # periodic cloud polling entirely - the entity stays registered
+        # feature was added, before any release. `Device.init_coordinators`
+        # checks the same flag before even creating
+        # `self.device.vacuum_map_coordinator`, so when it's set there's no
+        # coordinator to subscribe to below - the entity stays registered
         # (so re-enabling later needs no restart) but never fetches
         # anything. Map *listing* (vacuum.py: save/switch/rename saved
         # maps) is local-only and deliberately unaffected by this flag.
-        if self.custom_config_bool('disable_map_camera'):
-            self.logger.info('%s: disable_map_camera set, map camera disabled', self.name_model)
+        coordinator = self.device.vacuum_map_coordinator
+        if not coordinator:
+            self.logger.info('%s: no vacuum map coordinator (disable_map_camera set?), map camera disabled', self.name_model)
             return
-        self.async_on_remove(
-            async_track_time_interval(self.hass, self._async_refresh_map_tick, timedelta(seconds=30))
-        )
-        await self._async_refresh_map()
+        self._map_data = self.device.data.get('vacuum_map')
+        self.async_on_remove(coordinator.async_add_listener(self._handle_map_coordinator_update))
 
-    async def _async_refresh_map_tick(self, now=None):
-        await self._async_refresh_map()
-
-    async def _async_refresh_map(self):
-        if not self._map_obj_name_prop:
-            return
-        cloud = self.device.cloud
-        if not cloud or not cloud.service_token:
-            # No cloud session, or a session that isn't actually logged in
-            # (e.g. Xiaomi's need_verify challenge) - skip the whole cycle,
-            # including the local read below, rather than firing a cloud
-            # request every 30s that we already know will fail. Once the
-            # account re-authenticates elsewhere (service_token gets set
-            # again), refreshes resume on their own - no restart needed.
-            self.logger.debug('%s: no authenticated cloud session, skipping map refresh', self.name_model)
-            return
-        try:
-            obj_name = await self._async_fetch_map_obj_name()
-            if not obj_name:
-                return
-            result = await cloud.async_request_api('/v2/home/get_interim_file_url_pro', {'obj_name': obj_name})
-            url = (result or {}).get('result', {}).get('url')
-            if not url:
-                self.logger.debug('%s: get_interim_file_url_pro returned no url: %s', self.name_model, result)
-                return
-            session = async_get_clientsession(self.hass)
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                raw_bytes = await resp.read()
-            self._map_data = decrypt_map_payload(raw_bytes, self.device.model, self.device.did)
-            self.async_write_ha_state()
-        except Exception as exc:
-            # A transient miss shouldn't blank out an otherwise-good map.
-            self.logger.debug('%s: map refresh failed, keeping last map: %s', self.name_model, exc)
-
-    async def _async_fetch_map_obj_name(self):
-        if not self.device.local:
-            return None
-        try:
-            results = await self.device.local.async_get_properties_for_mapping(
-                did=self.device.did,
-                mapping={'value': {'siid': self._map_obj_name_prop.siid, 'piid': self._map_obj_name_prop.iid}},
-            )
-        except Exception as exc:
-            self.logger.debug('%s: failed to read map_obj_name: %s', self.name_model, exc)
-            return None
-        for item in results or []:
-            if item.get('code') == 0 and item.get('value'):
-                try:
-                    return json.loads(item['value']).get('obj_name')
-                except (TypeError, ValueError):
-                    return None
-        return None
+    def _handle_map_coordinator_update(self):
+        self._map_data = self.device.data.get('vacuum_map')
+        self.async_write_ha_state()
 
     def _toggle(self, entity_id):
         """Fail-open (missing/unavailable helper == show the layer) - same
@@ -884,16 +839,26 @@ class RobotMapCamera(MiotEntity, Camera):
     async def async_camera_image(self, width=None, height=None):
         if not isinstance(self._map_data, dict):
             return None
-        show_base = self._toggle('switch.map_show_base')
-        show_robot = self._toggle('switch.map_show_robot')
-        show_zones = self._toggle('switch.map_show_zones')
-        # _map_data is only ever replaced wholesale with a new dict (never
-        # mutated in place - see _async_refresh_map), so its id() is a
-        # cheap, reliable "has anything actually changed" check. Without
-        # this, every dashboard viewer/reload/poll re-runs the full Pillow
-        # render (drawing paths/zones/icons) even when the map and toggles
-        # are identical to the last request - wasted CPU on every request,
-        # not just when something new is available.
+        # Device-scoped (see __init__) - vacuum.py's MAP_DISPLAY_TOGGLES
+        # switches are created with the same prefix, so this always finds
+        # this camera's own vacuum's toggles, not another H50 Pro's.
+        # entity_id_prefix is itself a full "xiaomi_miot.<prefix>" entity_id
+        # (see __init__.py's BaseEntity.entity_id_prefix) - split off that
+        # leading domain, same as BaseSubEntity.generate_entity_id does for
+        # every other consumer of this property, so the object_id half
+        # doesn't end up with a stray "xiaomi_miot." baked into it.
+        prefix = self.entity_id_prefix.split('.', 1)[-1]
+        show_base = self._toggle(f'switch.{prefix}_map_show_base')
+        show_robot = self._toggle(f'switch.{prefix}_map_show_robot')
+        show_zones = self._toggle(f'switch.{prefix}_map_show_zones')
+        # _map_data is only ever replaced wholesale with a new dict when its
+        # content actually changed (never mutated in place - see
+        # Device.update_vacuum_map), so its id() is a cheap, reliable "has
+        # anything actually changed" check. Without this, every dashboard
+        # viewer/reload/poll re-runs the full Pillow render (drawing
+        # paths/zones/icons) even when the map and toggles are identical to
+        # the last request - wasted CPU on every request, not just when
+        # something new is available.
         cache_key = (id(self._map_data), show_base, show_robot, show_zones)
         if cache_key == self._render_cache_key and self._render_cache_png is not None:
             return self._render_cache_png

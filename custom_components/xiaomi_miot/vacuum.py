@@ -7,6 +7,7 @@ from datetime import timedelta
 from homeassistant.components.vacuum import (  # noqa: F401
     DOMAIN as ENTITY_DOMAIN,
     StateVacuumEntity,
+    VacuumActivity,
     VacuumEntityFeature,  # v2022.5
 )
 from homeassistant.components.switch import SwitchEntity
@@ -16,7 +17,6 @@ from homeassistant.components.sensor import SensorEntity
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
-from .core.const import VacuumActivity
 
 from . import (
     DOMAIN,

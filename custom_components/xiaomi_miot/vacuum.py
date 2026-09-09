@@ -746,7 +746,16 @@ class MiotOv42glVacuumEntity(MiotVacuumEntity):
         if not act:
             return False
         result = await self.async_call_action(act, [','.join(str(r) for r in room_ids)])
-        return bool(result and result.is_success)
+        if not result or not result.is_success:
+            # Surfaced as a HA notification/toast - a rejected room-sweep
+            # (e.g. the device reporting offline to the cloud, a stale
+            # room id after a re-map) previously failed silently: the
+            # button press returned False with no exception, no log at the
+            # default level, and the room switches were reset to off right
+            # after regardless, giving no indication anything went wrong.
+            reason = (result.error or result.spec_error) if result else 'no response'
+            raise HomeAssistantError(f'Failed to start room sweep: {reason}')
+        return True
 
     async def _async_clean_selected_rooms(self, room_switches, **kwargs):
         selected = [room_id for room_id, sw in room_switches.items() if sw.is_on]
